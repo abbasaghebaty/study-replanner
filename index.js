@@ -1,4 +1,4 @@
-import {
+import { 
   tehranToday, sessionDaysByBook, computePhase1, computeAssign,
 } from "./planner.js";
 
