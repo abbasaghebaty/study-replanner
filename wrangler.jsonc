@@ -1,0 +1,14 @@
+{
+  "name": "study-replanner",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "study-planner",
+      "database_id": "e0b69f5d-1833-44a1-972a-049ecf5e9038"
+    }
+  ],
+  // هر شب ساعت ۰۰:۰۵ به وقت تهران (۲۰:۳۵ UTC)
+  "triggers": { "crons": ["35 20 * * *"] }
+}
