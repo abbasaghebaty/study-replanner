@@ -1,0 +1,18 @@
+# study-replanner — src/planner.js  (تابع planPageWork)
+# مشکل: پیش‌مطالعه به‌صورت پیش‌فرض بعد از ۸ صفحه بریده می‌شد، نه در ابتدای درس/فصل بعدی.
+# مثال: زیست تا ص ۲۰ تدریس شده و فصل ۲ از ص ۳۱ شروع می‌شود → باید ۲۱ تا ۳۰ بیاید.
+
+--- a/src/planner.js
++++ b/src/planner.js
+@@
+-  const previewSpan = Math.max(1, Math.floor(cfg.preview_max_pages ?? 8));
++  const previewSpan = Math.max(1, Math.floor(cfg.preview_max_pages ?? 40)); // سقف ایمنی؛ حد اصلی همان فهرست کتاب است
+@@
+     if (b.preview_needed) {
+       const lo = info.page + 1;
+       const nb = bounds.find((x) => x > lo);
+-      const hi = Math.min(nb != null ? nb - 1 : lo + previewSpan - 1, lo + previewSpan - 1);
++      // تا قبل از شروع درس/فصل بعدی؛ اگر درس بعدی در فهرست نیست (آخر کتاب) فقط ۸ صفحه
++      const hi = nb != null ? Math.min(nb - 1, lo + previewSpan - 1) : lo + 7;
+       for (const [a, z] of gapRanges(lo, hi, countsFor("preview"), 1)) emit("preview", a, z);
+     }
