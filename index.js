@@ -16,6 +16,7 @@ async function loadState(db) {
   const cfg = Object.fromEntries(cfgRows.map((r) => [r.key, r.value]));
   const prio = new Map(books.map((b) => [b.id, b.priority]));
   return {
+    raw: [cfgRows, books, sched, plan, homework, exams, progress, toc], // used for the change fingerprint
     cfg, books, plan, homework, exams, progress, toc,
     sessions: sessionDaysByBook(books, sched),
     priorityOf: (id) => prio.get(id)
@@ -119,6 +120,42 @@ export async function replan(env, { dry = false, now = Date.now() } = {}) {
   };
 }
 
+// ───────────── change detection ─────────────
+// D1 cannot call a worker when a row changes, so a cheap cron tick (every 5 min) fingerprints
+// everything the planner reads (plus today's Tehran date) and only replans when it differs from
+// the fingerprint stored after the previous run.
+
+async function fingerprint(state, today) {
+  const bytes = new TextEncoder().encode(JSON.stringify([today, state.raw]));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const ensureStateTable = (db) =>
+  db.prepare("CREATE TABLE IF NOT EXISTS replan_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)").run();
+
+export async function syncReplan(env, { force = false, now = Date.now() } = {}) {
+  const db = env.DB;
+  await ensureStateTable(db);
+  const today = tehranToday(now);
+  const before = await fingerprint(await loadState(db), today);
+  const stored = (await db.prepare("SELECT value FROM replan_state WHERE key='fingerprint'").first())?.value;
+  if (!force && stored === before) return { ok: true, skipped: true, reason: "no changes", today };
+  const result = await replan(env, { now });
+  // fingerprint of the state the run left behind, so our own writes don't trigger another run
+  const after = await fingerprint(await loadState(db), today);
+  await db
+    .prepare(
+      "INSERT INTO replan_state(key,value,updated_at) VALUES('fingerprint',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
+    )
+    .bind(after, new Date(now).toISOString())
+    .run();
+  return { ...result, trigger: force ? "forced" : "db_changed" };
+}
+
+// must be identical to the 12-hour entry in wrangler.jsonc
+const FORCED_CRON = "35 20,8 * * *";
+
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
     status,
@@ -133,7 +170,8 @@ export default {
       const token = env.REPLAN_TOKEN;
       if (!token || request.headers.get("Authorization") !== `Bearer ${token}`) return json({ error: "unauthorized" }, 401);
       try {
-        return json(await replan(env, { dry: url.searchParams.get("dry") === "1" }));
+        if (url.searchParams.get("dry") === "1") return json(await replan(env, { dry: true }));
+        return json(await syncReplan(env, { force: true }));
       } catch (e) {
         console.error("replan failed", e);
         return json({ error: "replan failed", detail: String(e?.message || e) }, 500);
@@ -141,7 +179,9 @@ export default {
     }
     return json({ error: "not found" }, 404);
   },
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(replan(env).catch((e) => console.error("scheduled replan failed", e)));
+  async scheduled(event, env, ctx) {
+    // the 12-hour cron always replans; the 5-minute cron replans only if the database changed
+    const force = event.cron === FORCED_CRON;
+    ctx.waitUntil(syncReplan(env, { force }).catch((e) => console.error("scheduled replan failed", e)));
   }
 };
