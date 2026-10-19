@@ -313,13 +313,18 @@ export function computePhase1(state, today) {
 
 // ───────────────────────── phase 2: spread live work over the next 7 days ─────────────────────────
 //
-// Front-loaded assignment:
-//  1) rows are sorted by score, highest first;
-//  2) day capacities are descending (n, n-1, ..., 1): day 1 is the heaviest, day 7 the lightest;
-//  3) rows that can only go on one day (due today) are fixed first so they count toward that day's load;
-//  4) every other row, most important first, takes the earliest eligible day that still has room;
-//  5) parts of one group stay in order on consecutive days;
+// Rank-based front-loading (replaces the old "first day with room" version):
+//  1) every row gets a score; rows are sorted by score, highest first;
+//  2) day quotas are descending (n, n-1, ..., 1): day 1 is the heaviest, the last day the lightest;
+//  3) the row at rank r simply goes to the day whose quota range contains r
+//     -> the top-scored rows always land on day 1, the next ones on day 2, ...
+//  4) only the due date can pull a row EARLIER than its rank day (it can never push a row later);
+//  5) parts of one group (part 1, 2, 3 ...) stay in order on consecutive days;
 //  6) the due date always wins.
+//
+// Why the old version was wrong: it first locked every "due today" row into day 1 and then filled
+// the remaining room by score, so high-score rows that were not due yet got pushed to day 2-3
+// while low-score rows that were due today sat on day 1. Now rank decides the day, not leftovers.
 
 export function computeAssign(rows, today, cfg, priorityOf) {
   const horizon = [];
@@ -337,54 +342,50 @@ export function computeAssign(rows, today, cfg, priorityOf) {
   }));
   scored.sort((a, b) => b.score - a.score || (a.part_no || 0) - (b.part_no || 0) || a.seq - b.seq);
 
-  // descending day capacities
+  // descending quotas -> cumulative rank boundaries (bounds[i] = first rank that is NOT on day i)
+  const N = scored.length;
   const wsum = (n * (n + 1)) / 2;
-  const target = new Map(horizon.map((d, i) => [d, (scored.length * (n - i)) / wsum]));
-  const load = new Map(horizon.map((d) => [d, 0]));
-  const lastByGroup = new Map();
-  const assignments = new Map();
-  const eligible = (r) => {
-    const e = horizon.filter((d) => d <= r.due_date);
-    return e.length ? e : [horizon[0]];
+  const bounds = [];
+  let cum = 0;
+  for (let i = 0; i < n; i++) {
+    cum += (N * (n - i)) / wsum;
+    bounds.push(i === n - 1 ? N : Math.round(cum));
+  }
+  const dayOfRank = (rank) => {
+    for (let i = 0; i < n; i++) if (rank < bounds[i]) return i;
+    return n - 1;
   };
 
-  // pass 1: single-day rows
-  const rest = [];
-  for (const r of scored) {
-    const e = eligible(r);
-    const grouped = r.group_key && (r.parts_total || 0) > 1;
-    if (e.length === 1 && !grouped) {
-      assignments.set(r.id, e[0]);
-      load.set(e[0], load.get(e[0]) + 1);
-    } else rest.push(r);
-  }
+  const load = new Map(horizon.map((d) => [d, 0]));
+  const lastIdxByGroup = new Map();
+  const assignments = new Map();
 
-  // pass 2: most important first -> earliest eligible day with room
-  for (const r of rest) {
+  scored.forEach((r, rank) => {
     const grouped = r.group_key && (r.parts_total || 0) > 1;
-    const e = eligible(r);
-    const minDate = grouped && lastByGroup.has(r.group_key) ? addDays(lastByGroup.get(r.group_key), 1) : horizon[0];
-    const reserve = grouped && r.part_no ? Math.max(0, r.parts_total - r.part_no) : 0;
-    const limit = Math.max(0, e.length - 1 - reserve);
-    let cands = e.filter((d, i) => d >= minDate && i <= limit);
-    if (!cands.length) cands = e.filter((d) => d >= minDate);
-    if (!cands.length) cands = [e[e.length - 1]];
 
-    let best = cands.find((d) => load.get(d) < Math.ceil(target.get(d) - 1e-9));
-    if (!best) {
-      let bv = Infinity;
-      for (const d of cands) {
-        const v = load.get(d) / target.get(d);
-        if (v < bv - 1e-9) {
-          bv = v;
-          best = d;
-        }
-      }
+    // last day index this row may use (due date)
+    let maxIdx = -1;
+    horizon.forEach((d, i) => {
+      if (d <= r.due_date) maxIdx = i;
+    });
+    if (maxIdx < 0) maxIdx = 0;
+
+    let idx = dayOfRank(rank);
+
+    if (grouped) {
+      // leave room before the due date for the parts that still come after this one
+      const reserve = r.part_no ? Math.max(0, r.parts_total - r.part_no) : 0;
+      idx = Math.min(idx, Math.max(0, maxIdx - reserve));
+      // parts stay in order, one per day
+      if (lastIdxByGroup.has(r.group_key)) idx = Math.max(idx, lastIdxByGroup.get(r.group_key) + 1);
     }
-    load.set(best, load.get(best) + 1);
-    assignments.set(r.id, best);
-    if (grouped) lastByGroup.set(r.group_key, best);
-  }
+
+    idx = Math.min(idx, maxIdx); // the due date always wins
+    const day = horizon[idx];
+    assignments.set(r.id, day);
+    load.set(day, load.get(day) + 1);
+    if (grouped) lastIdxByGroup.set(r.group_key, idx);
+  });
 
   return {
     assignments,
