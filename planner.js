@@ -47,15 +47,10 @@ export const score = (cfg, kind, priority, d) =>
   cfg["kind_" + kind] * (cfg.subject_base - priority) * (cfg.urgency_base + cfg.urgency_scale / (d + 1) ** 2);
 
 // ───────────────────────── page-based review / preview ─────────────────────────
-//
-// Idea: review and preview rows in `plan` carry page_from/page_to. The set of pages already
-// covered is simply "plan rows with status='done' (plus live todo rows)", so there is no extra
-// table to keep in sync. Teaching progress comes from progress_log.
 
 const PAGE_KINDS = new Set(["review", "preview"]);
 export const isPagedWork = (r) => PAGE_KINDS.has(r.kind) && r.page_from != null && r.page_to != null;
 
-// Page numbers where a new lesson / chapter / problem-set starts (used to find lesson ends).
 export function tocBoundaries(rows) {
   const s = new Set();
   for (const t of rows) {
@@ -65,8 +60,6 @@ export function tocBoundaries(rows) {
   return [...s].sort((a, b) => a - b);
 }
 
-// Last page the teacher has covered. Newest report wins (report_date, then id).
-// A report gives either up_to_page, or toc_id (= the whole lesson up to the next boundary).
 export function taughtInfo(progressRows, tocRows) {
   const bounds = tocBoundaries(tocRows);
   const byId = new Map(tocRows.map((t) => [t.id, t]));
@@ -86,7 +79,6 @@ export function taughtInfo(progressRows, tocRows) {
   return null;
 }
 
-// contiguous page ranges inside [lo, hi] whose coverage count is below `target`
 export function gapRanges(lo, hi, counts, target) {
   const out = [];
   let start = null;
@@ -101,7 +93,6 @@ export function gapRanges(lo, hi, counts, target) {
   return out;
 }
 
-// split [a, z] into evenly sized chunks of at most `max` pages
 export function chunkRange(a, z, max) {
   const len = z - a + 1;
   const n = Math.max(1, Math.ceil(len / max));
@@ -138,7 +129,6 @@ export function planPageWork({ books, plan, toc, progress, sessions, cfg, today,
     const delivery = nextSession(sessions.get(b.id) || [], today) || addDays(today, 7);
     const due = maxDate(deadlineBefore(delivery), today);
 
-    // how many times each page is already covered: done rows + still-live todo rows
     const countsFor = (kind) => {
       const m = new Map();
       for (const r of plan) {
@@ -172,16 +162,13 @@ export function planPageWork({ books, plan, toc, progress, sessions, cfg, today,
       });
     };
 
-    // reviews: taught pages that have not been reviewed `target` times yet
     const target = b.max_reviews == null ? reviewTarget : Math.min(reviewTarget, b.max_reviews);
     if (target > 0) {
-      // first page worth reviewing = start of the first real lesson (skips chapter title pages)
       const lessonStarts = myToc.filter((t) => t.lesson != null && t.start_page > 0).map((t) => t.start_page);
       const lo = lessonStarts.length ? Math.min(...lessonStarts) : bounds[0] ?? 1;
       for (const [a, z] of gapRanges(lo, info.page, countsFor("review"), target)) emit("review", a, z);
     }
 
-    // previews: the next stretch of the book (until the lesson ends, at most previewSpan pages)
     if (b.preview_needed) {
       const lo = info.page + 1;
       const nb = bounds.find((x) => x > lo);
@@ -204,7 +191,6 @@ export function computePhase1(state, today) {
   const lapses = [];
   const hwExtensions = new Map();
 
-  // A) previews die as soon as the teacher has covered their first page ("taught"); no extension.
   const taughtByBook = new Map();
   for (const b of books) {
     const mine = progress.filter((p) => p.book_id === b.id);
@@ -220,8 +206,6 @@ export function computePhase1(state, today) {
     }
   }
 
-  // B) overdue work: homework/legacy rows are extended; page-based review/preview are simply
-  //    closed as missed and get regenerated below from the pages that are still uncovered.
   for (const r of plan) {
     if (r.status !== "todo" || r.due_date >= today || burned.has(r.id)) continue;
     const l = { id: r.id, reason: "missed", clone: null };
@@ -240,7 +224,6 @@ export function computePhase1(state, today) {
     lapses.push(l);
   }
 
-  // C) new rows: homework, exams (unchanged logic) …
   const have = new Set(plan.filter((p) => p.source_type).map((p) => p.source_type + ":" + p.source_id));
   const generated = [];
   for (const h of homework) {
@@ -301,7 +284,6 @@ export function computePhase1(state, today) {
     }
   }
 
-  // … and page-based review / preview from teaching progress
   const pw = planPageWork({
     books, plan, toc, progress, sessions, cfg, today,
     deadIds: new Set(lapses.map((l) => l.id))
@@ -313,18 +295,20 @@ export function computePhase1(state, today) {
 
 // ───────────────────────── phase 2: spread live work over the next 7 days ─────────────────────────
 //
-// Rank-based front-loading (replaces the old "first day with room" version):
-//  1) every row gets a score; rows are sorted by score, highest first;
-//  2) day quotas are descending (n, n-1, ..., 1): day 1 is the heaviest, the last day the lightest;
-//  3) the row at rank r simply goes to the day whose quota range contains r
-//     -> the top-scored rows always land on day 1, the next ones on day 2, ...
-//  4) only the due date can pull a row EARLIER than its rank day (it can never push a row later);
-//  5) parts of one group (part 1, 2, 3 ...) stay in order on consecutive days;
-//  6) the due date always wins.
+// REDESIGNED (v3) — "equal count per day, strictly descending score".
 //
-// Why the old version was wrong: it first locked every "due today" row into day 1 and then filled
-// the remaining room by score, so high-score rows that were not due yet got pushed to day 2-3
-// while low-score rows that were due today sat on day 1. Now rank decides the day, not leftovers.
+//  1) every row gets a score; rows are sorted by score, highest first;
+//  2) every day gets (almost) the SAME number of tasks:  N / days  (the remainder goes to the first days);
+//  3) days are filled in order: day 1 takes the highest-score tasks, day 2 the next ones, ... so every
+//     task on day k scores >= every task on day k+1 (a perfect staircase from top to bottom);
+//  4) the ONLY thing allowed to break the staircase is a hard due date: a task that cannot wait
+//     (its last allowed day is today / tomorrow ...) is pulled forward just enough to stay feasible.
+//     The check looks ahead (earliest-deadline-first), so it pulls forward the minimum number of tasks;
+//  5) parts of one group (part 1, 2, 3 ...) stay in order, never two parts of the same group on one day;
+//  6) nothing here ever pushes a task past its due date.
+//
+// The old version used "descending quotas" (day 1 heavy, day 7 light) and locked every "due today" row
+// into day 1 first — that is why you saw 48→12 today, 48→6 tomorrow, 42→… the next day.
 
 export function computeAssign(rows, today, cfg, priorityOf) {
   const horizon = [];
@@ -335,57 +319,110 @@ export function computeAssign(rows, today, cfg, priorityOf) {
   if (!horizon.length) horizon.push(today);
 
   const n = horizon.length;
-  const scored = rows.map((r, seq) => ({
-    ...r,
-    seq,
-    score: score(cfg, r.kind, priorityOf(r.book_id), diffDays(r.due_date, today))
-  }));
-  scored.sort((a, b) => b.score - a.score || (a.part_no || 0) - (b.part_no || 0) || a.seq - b.seq);
+  const N = rows.length;
 
-  // descending quotas -> cumulative rank boundaries (bounds[i] = first rank that is NOT on day i)
-  const N = scored.length;
-  const wsum = (n * (n + 1)) / 2;
-  const bounds = [];
-  let cum = 0;
-  for (let i = 0; i < n; i++) {
-    cum += (N * (n - i)) / wsum;
-    bounds.push(i === n - 1 ? N : Math.round(cum));
-  }
-  const dayOfRank = (rank) => {
-    for (let i = 0; i < n; i++) if (rank < bounds[i]) return i;
-    return n - 1;
-  };
-
-  const load = new Map(horizon.map((d) => [d, 0]));
-  const lastIdxByGroup = new Map();
-  const assignments = new Map();
-
-  scored.forEach((r, rank) => {
-    const grouped = r.group_key && (r.parts_total || 0) > 1;
-
-    // last day index this row may use (due date)
+  const scored = rows.map((r, seq) => {
     let maxIdx = -1;
     horizon.forEach((d, i) => {
       if (d <= r.due_date) maxIdx = i;
     });
-    if (maxIdx < 0) maxIdx = 0;
-
-    let idx = dayOfRank(rank);
-
-    if (grouped) {
-      // leave room before the due date for the parts that still come after this one
-      const reserve = r.part_no ? Math.max(0, r.parts_total - r.part_no) : 0;
-      idx = Math.min(idx, Math.max(0, maxIdx - reserve));
-      // parts stay in order, one per day
-      if (lastIdxByGroup.has(r.group_key)) idx = Math.max(idx, lastIdxByGroup.get(r.group_key) + 1);
+    if (maxIdx < 0) maxIdx = 0; // already due -> must be today
+    // later parts of a group need their own day, so part p of T must start T-p days before the due date
+    if (r.group_key && (r.parts_total || 0) > 1 && r.part_no) {
+      maxIdx = Math.max(0, maxIdx - (r.parts_total - r.part_no));
     }
-
-    idx = Math.min(idx, maxIdx); // the due date always wins
-    const day = horizon[idx];
-    assignments.set(r.id, day);
-    load.set(day, load.get(day) + 1);
-    if (grouped) lastIdxByGroup.set(r.group_key, idx);
+    return {
+      ...r,
+      seq,
+      maxIdx,
+      score: score(cfg, r.kind, priorityOf(r.book_id), diffDays(r.due_date, today))
+    };
   });
+  scored.sort((a, b) => b.score - a.score || (a.part_no || 0) - (b.part_no || 0) || a.seq - b.seq);
+
+  // equal daily capacity (remainder to the first days)
+  const base = Math.floor(N / n);
+  const extra = N % n;
+  const cap = horizon.map((_, i) => base + (i < extra ? 1 : 0));
+
+  const assignments = new Map();
+  const load = new Map(horizon.map((d) => [d, 0]));
+  const unplaced = new Set(scored.map((r) => r.id));
+  const byId = new Map(scored.map((r) => [r.id, r]));
+  const lastIdxByGroup = new Map();
+  const placedParts = new Map(); // group_key -> Set(part_no)
+
+  const grouped = (r) => r.group_key && (r.parts_total || 0) > 1;
+
+  const place = (r, i) => {
+    assignments.set(r.id, horizon[i]);
+    load.set(horizon[i], load.get(horizon[i]) + 1);
+    unplaced.delete(r.id);
+    if (grouped(r)) {
+      lastIdxByGroup.set(r.group_key, i);
+      if (!placedParts.has(r.group_key)) placedParts.set(r.group_key, new Set());
+      placedParts.get(r.group_key).add(r.part_no);
+    }
+  };
+
+  // a part may only be placed if all lower parts are placed on an EARLIER day
+  const eligible = (r, i) => {
+    if (!grouped(r)) return true;
+    if (lastIdxByGroup.has(r.group_key) && lastIdxByGroup.get(r.group_key) >= i) return false;
+    const done = placedParts.get(r.group_key) || new Set();
+    for (let p = 1; p < (r.part_no || 1); p++) if (!done.has(p)) return false;
+    return true;
+  };
+
+  for (let i = 0; i < n; i++) {
+    const rest = scored.filter((r) => unplaced.has(r.id));
+    if (!rest.length) break;
+
+    // how many must be placed TODAY so that every later deadline is still reachable
+    let mustToday = 0;
+    let capAfter = 0;
+    for (let j = i; j < n; j++) {
+      if (j > i) capAfter += cap[j];
+      const need = rest.filter((r) => r.maxIdx <= j).length;
+      mustToday = Math.max(mustToday, need - capAfter);
+    }
+    const slots = i === n - 1 ? rest.length : Math.max(cap[i], mustToday);
+
+    const cand = rest.filter((r) => eligible(r, i));
+    const chosen = [];
+
+    // 1. forced tasks: earliest deadline first, then score
+    const forced = [...cand].sort((a, b) => a.maxIdx - b.maxIdx || b.score - a.score);
+    for (const r of forced) {
+      if (chosen.length >= mustToday) break;
+      chosen.push(r);
+    }
+    // 2. the rest of the day: highest score first
+    const chosenIds = new Set(chosen.map((r) => r.id));
+    for (const r of cand) {
+      if (chosen.length >= slots) break;
+      if (chosenIds.has(r.id)) continue;
+      // never two parts of the same group on the same day
+      if (grouped(r) && chosen.some((c) => c.group_key === r.group_key)) continue;
+      chosen.push(r);
+      chosenIds.add(r.id);
+    }
+    // parts of one group inside the forced list: keep only the first per day
+    const seenGroup = new Set();
+    for (const r of chosen) {
+      if (grouped(r)) {
+        if (seenGroup.has(r.group_key)) continue;
+        seenGroup.add(r.group_key);
+      }
+      place(r, i);
+    }
+  }
+
+  // safety net: anything left (only possible through group ordering) goes to its last allowed day
+  for (const id of [...unplaced]) {
+    const r = byId.get(id);
+    place(r, Math.min(r.maxIdx, n - 1));
+  }
 
   return {
     assignments,
